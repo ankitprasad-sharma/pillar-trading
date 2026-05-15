@@ -1,0 +1,30 @@
+# API Keys — NEVER commit these
+.env
+
+# Python environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Trading data — personal, changes constantly
+paper_trades.json
+signals_log.csv
+auto_trades.log
+
+# Debug/test files — not needed in repo
+debug_feed.py
+debug_options.py
+test_keys.py
+list_models.py
+silence.py
+
+# System files
+.DS_Store
+*.log
+*.tmp
+
+# IDE files
+.vscode/
+.idea/
