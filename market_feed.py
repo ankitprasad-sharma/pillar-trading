@@ -71,6 +71,13 @@ state = {
     "gap_signal"      : None,    # BUY_CALL / BUY_PUT / None
     "gap_traded"      : False,   # one trade per day guard
     "gap_status"      : "WAITING",   # WAITING / GAP UP x% / GAP DOWN x% / NO GAP / SKIP-* / TRADED
+    # VWAP Reversal state
+    "vwap"            : None,        # current rolling 30-candle VWAP proxy
+    "rsi"             : None,        # current RSI(14)
+    "vwap_deviation"  : None,        # (ltp - vwap) / vwap
+    "vwap_signal"     : None,        # BUY_CALL / BUY_PUT set by on_vwap_signal
+    "vwap_traded"     : False,       # one trade per day guard
+    "vwap_status"     : "WAITING",   # WAITING / COMPUTING / WATCHING / SIGNAL / TRADED / SKIPPED
 }
 
 _draw_lock      = threading.Lock()
@@ -79,6 +86,27 @@ _streamer       = None
 _last_draw      = 0
 _last_tick_time = time.time()   # updated on every real WS message
 _sub_strike     = None
+_price_buffer   = []    # rolling Nifty closes for VWAP proxy and RSI
+_vwap_day       = None  # date string — buffer resets on new day
+
+
+def _compute_rsi(closes: list, period: int = 14) -> float:
+    """Wilder smoothing RSI for VWAP reversal."""
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_g / avg_l)
 
 
 def heartbeat_loop():
@@ -379,6 +407,23 @@ def draw():
         else:
             lines.append(f"  {D}GAP: Waiting for 9:15 AM first tick{X}")
 
+        vwap_v = state.get("vwap")
+        rsi_v  = state.get("rsi")
+        v_st   = state.get("vwap_status", "WAITING")
+        if sm == "VWAP_REVERSAL" or vwap_v is not None:
+            if vwap_v is not None:
+                dev_pct = (state.get("vwap_deviation") or 0) * 100
+                dev_c   = G if dev_pct >= 0 else R
+                rsi_c   = R if (rsi_v or 50) > 62 else (G if (rsi_v or 50) < 38 else W)
+                lines.append(
+                    f"  {C}VWAP: ₹{vwap_v:,.0f}  "
+                    f"Dev: {dev_c}{dev_pct:+.2f}%{X}  "
+                    f"{rsi_c}RSI: {rsi_v:.0f}{X}  "
+                    f"{D}{v_st}{X}"
+                )
+            else:
+                lines.append(f"  {D}VWAP: {v_st}{X}")
+
         lines.append(sep)
 
         # Pending signal alert
@@ -617,6 +662,12 @@ def on_message(message):
                     state["gap_signal"]       = None
                     state["gap_traded"]       = False
                     state["gap_status"]       = "WAITING"
+                    state["vwap"]             = None
+                    state["rsi"]              = None
+                    state["vwap_deviation"]   = None
+                    state["vwap_signal"]      = None
+                    state["vwap_traded"]      = False
+                    state["vwap_status"]      = "WAITING"
                 # Build range 9:15–9:30
                 if "09:15" <= _cur_t <= "09:30":
                     if state["orb_high"] is None:
@@ -668,6 +719,24 @@ def on_message(message):
                     else:
                         state["gap_status"] = f"NO GAP ({_gap:+.2f}% < ±0.5%)"
                         add_log(f"➡️  No gap: {_gap:+.2f}%")
+
+                # ── VWAP / RSI rolling buffer ─────────────────────────────────
+                global _price_buffer, _vwap_day
+                if _vwap_day != _cur_day:
+                    _price_buffer         = []
+                    _vwap_day             = _cur_day
+                    state["vwap_status"]  = "COMPUTING"
+                    state["vwap_traded"]  = False
+                    state["vwap_signal"]  = None
+                _price_buffer.append(ltp)
+                if len(_price_buffer) >= 30:
+                    _vwap = sum(_price_buffer[-30:]) / 30
+                    _rsi  = _compute_rsi(_price_buffer)
+                    state["vwap"]           = _vwap
+                    state["rsi"]            = _rsi
+                    state["vwap_deviation"] = (ltp - _vwap) / _vwap
+                    if state["vwap_status"] == "COMPUTING":
+                        state["vwap_status"] = "WATCHING"
 
                 threading.Thread(
                     target=subscribe_options,
@@ -926,6 +995,34 @@ def run_signal(market_data):
                     state["pos_instrument"]   = None
                     state["pos_premium_live"] = None
                     draw()
+            elif strategy_mode == "VWAP_REVERSAL":
+                target_pct = getattr(_main, "VWAP_PROFIT_TARGET", 25)
+                stop_pct   = getattr(_main, "VWAP_STOP_LOSS", -20)
+                vwap_v     = state.get("vwap")
+                nifty_ltp  = market_data.get("ltp", 0)
+                reverted   = False
+                if vwap_v and nifty_ltp:
+                    if pos["action"] == "BUY_PUT"  and nifty_ltp <= vwap_v:
+                        reverted = True
+                    elif pos["action"] == "BUY_CALL" and nifty_ltp >= vwap_v:
+                        reverted = True
+                vwap_exit = None
+                if cur_time >= "14:00":
+                    vwap_exit = f"⏰ 14:00 force exit ({cpct:+.1f}%)"
+                elif cpct >= target_pct:
+                    vwap_exit = f"🎯 +{cpct:.1f}% VWAP target"
+                elif cpct <= stop_pct:
+                    vwap_exit = f"🛑 {cpct:.1f}% VWAP stop"
+                elif reverted and cpct > -5:
+                    vwap_exit = f"↩️  reverted to VWAP ({cpct:+.1f}%)"
+                if vwap_exit:
+                    add_log(f"{vwap_exit} — closing!")
+                    _log_auto(f"AUTO-CLOSE VWAP | {pos.get('action')} {pos.get('trading_symbol','')} | entry ₹{ep} cur ₹{cur_p:.1f} {cpct:+.1f}% | {vwap_exit}")
+                    _execute_live_close(pos, cur_p)
+                    close_trade(market_data, cur_p, vwap_exit)
+                    state["pos_instrument"]   = None
+                    state["pos_premium_live"] = None
+                    draw()
             else:
                 if cpct >= 50:
                     add_log(f"🎯 +{cpct:.1f}% profit — closing!")
@@ -973,6 +1070,26 @@ def run_signal(market_data):
                     and cur_time < "10:00"):
                 state["gap_traded"] = True
                 result = _main.on_gap_signal(state["gap_pct"], market_data)
+            else:
+                result = None
+        elif strategy_mode == "VWAP_REVERSAL":
+            vwap_v = state.get("vwap")
+            rsi_v  = state.get("rsi")
+            ltp_v  = market_data.get("ltp", 0)
+            if (vwap_v and rsi_v and ltp_v
+                    and not state.get("vwap_traded")
+                    and not state.get("orb_traded_today")
+                    and "10:00" <= cur_time <= "13:30"):
+                dev = (ltp_v - vwap_v) / vwap_v
+                _vd = getattr(_main, "VWAP_DEVIATION", 0.003)
+                _rob = getattr(_main, "VWAP_RSI_OB", 60)
+                _ros = getattr(_main, "VWAP_RSI_OS", 40)
+                if (dev > _vd and rsi_v > _rob) or (dev < -_vd and rsi_v < _ros):
+                    state["vwap_traded"] = True
+                    state["vwap_status"] = "TRADED"
+                    result = _main.on_vwap_signal(vwap_v, ltp_v, rsi_v, market_data)
+                else:
+                    result = None
             else:
                 result = None
         else:

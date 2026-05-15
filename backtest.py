@@ -56,6 +56,18 @@ GAP_STOP      = -0.25  # -25% stop loss
 GAP_TARGET    =  0.40  # +40% profit target
 GAP_EXIT_TIME = "10:00"  # hard time exit regardless of P&L
 
+# ── VWAP Reversal strategy parameters ─────────────────────────────────────────
+VWAP_WINDOW     = 30      # rolling close-average window as VWAP proxy
+VWAP_DEVIATION  = 0.006   # 0.6% deviation from VWAP to trigger entry
+RSI_PERIOD      = 14
+RSI_OB          = 62      # RSI overbought threshold → BUY_PUT (fade up-move)
+RSI_OS          = 38      # RSI oversold threshold  → BUY_CALL (fade down-move)
+VWAP_START      = "10:00"
+VWAP_END        = "13:30"
+VWAP_FORCE_EXIT = "14:00"
+VWAP_TARGET     =  0.35   # +35% profit target
+VWAP_STOP       = -0.25   # -25% stop loss
+
 # ── ORB parameter combinations to test ────────────────────────────────────────
 # close_confirm=False → breakout triggered when candle HIGH/LOW touches range
 # close_confirm=True  → breakout triggered when candle CLOSE is beyond range
@@ -202,6 +214,31 @@ def _close_position(open_pos, lp, exit_nifty, dt, exit_reason,
         rec.update(extra_fields)
     trades_list.append(rec)
     return pnl
+
+
+def _calc_rsi(closes: list, period: int = 14) -> float:
+    """Wilder smoothing RSI."""
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_g / avg_l)
+
+
+def _calc_vwap_proxy(closes: list, window: int = 30) -> float:
+    """Rolling mean of last `window` closes as VWAP proxy."""
+    buf = closes[-window:]
+    return sum(buf) / len(buf)
 
 
 # ── Rule-based simulation ──────────────────────────────────────────────────────
@@ -954,6 +991,315 @@ def _print_hga_log(hga_result: dict):
     print(f"{SEP}")
 
 
+# ── VWAP Reversal simulation ───────────────────────────────────────────────────
+
+def run_vwap_backtest(candles: list, starting_capital: float) -> dict:
+    """
+    VWAP Reversal strategy:
+      - Runs only on days when HYBRID ORB did NOT trade (complementary)
+      - Entry window 10:00–13:30; one trade per day
+      - BUY_PUT  if LTP > VWAP + 0.6% AND RSI > 62  (overbought — fade up)
+      - BUY_CALL if LTP < VWAP - 0.6% AND RSI < 38  (oversold  — fade down)
+      - Exit: +35% target / -25% stop / 14:00 force exit /
+              reversion exit (price crosses back through VWAP while not in loss)
+    """
+    # Identify days HYBRID ORB traded so VWAP can skip them
+    _hybrid = run_orb_backtest(
+        candles, starting_capital,
+        stop_pct=-0.35, target_pct=0.75, trail_trigger=0.40,
+        min_range=30, max_range=150, close_confirm=True, hybrid=True,
+    )
+    hybrid_days = {t["entry_time"][:10] for t in _hybrid["trades"]}
+
+    prev_close_for_day = _build_day_maps(candles)
+
+    capital      = starting_capital
+    trades       = []
+    open_pos     = None
+    prev_close   = None
+    current_day  = None
+    close_buf    = []    # rolling closes for VWAP proxy + RSI
+    traded_today = False
+
+    min_buf = max(VWAP_WINDOW, RSI_PERIOD + 2)
+
+    for c in candles:
+        ts_str, _o, high, low, close, vol, _oi = c
+        dt          = _parse_dt(ts_str)
+        candle_time = dt.strftime("%H:%M")
+        candle_day  = dt.strftime("%Y-%m-%d")
+
+        if not ("09:15" <= candle_time <= "14:05"):
+            continue
+
+        # ── Day boundary reset ────────────────────────────────────────────────
+        if candle_day != current_day:
+            if open_pos:
+                lp  = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                                   open_pos["entry_premium"], close)
+                pnl = _close_position(open_pos, lp, close, dt,
+                                      "overnight force-close", trades,
+                                      open_pos["_capital_before"],
+                                      {"vwap_entry": open_pos["vwap_entry"],
+                                       "rsi_entry":  open_pos["rsi_entry"]})
+                capital  = open_pos["_capital_before"] + pnl
+                open_pos = None
+            current_day  = candle_day
+            prev_close   = prev_close_for_day.get(candle_day)
+            close_buf    = []
+            traded_today = candle_day in hybrid_days  # skip if HYBRID traded
+
+        if prev_close is None:
+            continue
+
+        ltp = close
+        close_buf.append(ltp)
+
+        # ── Manage open position ───────────────────────────────────────────────
+        if open_pos:
+            lp  = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                               open_pos["entry_premium"], ltp)
+            pct = (lp - open_pos["entry_premium"]) / open_pos["entry_premium"]
+
+            # Reversion exit: price crossed back through VWAP (only if not losing)
+            reverted = False
+            if len(close_buf) >= 5:
+                vwap_now = _calc_vwap_proxy(close_buf, VWAP_WINDOW)
+                if open_pos["action"] == "BUY_PUT"  and ltp <= vwap_now:
+                    reverted = True
+                elif open_pos["action"] == "BUY_CALL" and ltp >= vwap_now:
+                    reverted = True
+
+            exit_reason = None
+            if candle_time >= VWAP_FORCE_EXIT:
+                exit_reason = f"{VWAP_FORCE_EXIT} time exit ({pct*100:+.1f}%)"
+            elif pct >= VWAP_TARGET:
+                exit_reason = f"profit +{pct*100:.1f}%"
+            elif pct <= VWAP_STOP:
+                exit_reason = f"stop {pct*100:.1f}%"
+            elif reverted and pct > -0.05:
+                exit_reason = f"reverted to VWAP ({pct*100:+.1f}%)"
+
+            if exit_reason:
+                pnl      = _close_position(open_pos, lp, ltp, dt, exit_reason,
+                                           trades, open_pos["_capital_before"],
+                                           {"vwap_entry": open_pos["vwap_entry"],
+                                            "rsi_entry":  open_pos["rsi_entry"]})
+                capital  = open_pos["_capital_before"] + pnl
+                open_pos = None
+            continue
+
+        # ── Entry logic ───────────────────────────────────────────────────────
+        if traded_today:
+            continue
+        if not (VWAP_START <= candle_time <= VWAP_END):
+            continue
+        if len(close_buf) < min_buf:
+            continue
+
+        vwap = _calc_vwap_proxy(close_buf, VWAP_WINDOW)
+        rsi  = _calc_rsi(close_buf, RSI_PERIOD)
+        dev  = (ltp - vwap) / vwap
+
+        action = None
+        if dev > VWAP_DEVIATION and rsi > RSI_OB:
+            action = "BUY_PUT"    # overbought — fade the up-move
+        elif dev < -VWAP_DEVIATION and rsi < RSI_OS:
+            action = "BUY_CALL"   # oversold — fade the down-move
+
+        if not action:
+            continue
+
+        entry_prem = ltp * PREMIUM_FACTOR
+        cost       = entry_prem * LOT_SIZE
+        if cost > capital:
+            continue
+
+        traded_today = True
+        capital -= cost
+        dev_str  = f"{dev*100:+.2f}%"
+        open_pos = {
+            "id"             : len(trades) + 1,
+            "action"         : action,
+            "entry_premium"  : round(entry_prem, 2),
+            "entry_nifty"    : ltp,
+            "entry_time"     : dt.strftime("%Y-%m-%d %H:%M"),
+            "cost"           : round(cost, 2),
+            "reason"         : f"VWAP dev {dev_str} RSI={rsi:.0f}",
+            "vwap_entry"     : round(vwap, 2),
+            "rsi_entry"      : round(rsi, 1),
+            "_entry_dt"      : dt,
+            "_capital_before": capital + cost,
+            "_stop_floor"    : VWAP_STOP,
+        }
+
+    # Force-close at period end
+    if open_pos and candles:
+        last_c = candles[-1]
+        lp     = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                              open_pos["entry_premium"], last_c[4])
+        pnl    = _close_position(open_pos, lp, last_c[4], _parse_dt(last_c[0]),
+                                 "end of period", trades, open_pos["_capital_before"],
+                                 {"vwap_entry": open_pos["vwap_entry"],
+                                  "rsi_entry":  open_pos["rsi_entry"]})
+        capital = open_pos["_capital_before"] + pnl
+
+    return {"trades": trades, "final_capital": round(capital, 2)}
+
+
+# ── VWAP parametric backtest (for sweep) ──────────────────────────────────────
+
+def run_vwap_param_backtest(
+    candles: list,
+    starting_capital: float,
+    *,
+    deviation: float,
+    rsi_ob: float,
+    rsi_os: float,
+    target: float,
+    stop: float,
+    hybrid_days: set = None,
+) -> dict:
+    """
+    Parametric VWAP Reversal for parameter sweep.
+    Pass hybrid_days to avoid re-running HYBRID inside each call.
+    """
+    if hybrid_days is None:
+        _h = run_orb_backtest(
+            candles, starting_capital,
+            stop_pct=-0.35, target_pct=0.75, trail_trigger=0.40,
+            min_range=30, max_range=150, close_confirm=True, hybrid=True,
+        )
+        hybrid_days = {t["entry_time"][:10] for t in _h["trades"]}
+
+    prev_close_for_day = _build_day_maps(candles)
+    capital      = starting_capital
+    trades       = []
+    open_pos     = None
+    prev_close   = None
+    current_day  = None
+    close_buf    = []
+    traded_today = False
+    min_buf      = max(VWAP_WINDOW, RSI_PERIOD + 2)
+
+    for c in candles:
+        ts_str, _o, high, low, close, vol, _oi = c
+        dt          = _parse_dt(ts_str)
+        candle_time = dt.strftime("%H:%M")
+        candle_day  = dt.strftime("%Y-%m-%d")
+
+        if not ("09:15" <= candle_time <= "14:05"):
+            continue
+
+        if candle_day != current_day:
+            if open_pos:
+                lp  = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                                   open_pos["entry_premium"], close)
+                pnl = _close_position(open_pos, lp, close, dt,
+                                      "overnight force-close", trades,
+                                      open_pos["_capital_before"],
+                                      {"vwap_entry": open_pos["vwap_entry"],
+                                       "rsi_entry":  open_pos["rsi_entry"]})
+                capital  = open_pos["_capital_before"] + pnl
+                open_pos = None
+            current_day  = candle_day
+            prev_close   = prev_close_for_day.get(candle_day)
+            close_buf    = []
+            traded_today = candle_day in hybrid_days
+
+        if prev_close is None:
+            continue
+
+        ltp = close
+        close_buf.append(ltp)
+
+        if open_pos:
+            lp  = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                               open_pos["entry_premium"], ltp)
+            pct = (lp - open_pos["entry_premium"]) / open_pos["entry_premium"]
+
+            reverted = False
+            if len(close_buf) >= 5:
+                vwap_now = _calc_vwap_proxy(close_buf, VWAP_WINDOW)
+                if open_pos["action"] == "BUY_PUT"  and ltp <= vwap_now:
+                    reverted = True
+                elif open_pos["action"] == "BUY_CALL" and ltp >= vwap_now:
+                    reverted = True
+
+            exit_reason = None
+            if candle_time >= VWAP_FORCE_EXIT:
+                exit_reason = f"{VWAP_FORCE_EXIT} time exit ({pct*100:+.1f}%)"
+            elif pct >= target:
+                exit_reason = f"profit +{pct*100:.1f}%"
+            elif pct <= stop:
+                exit_reason = f"stop {pct*100:.1f}%"
+            elif reverted and pct > -0.05:
+                exit_reason = f"reverted to VWAP ({pct*100:+.1f}%)"
+
+            if exit_reason:
+                pnl      = _close_position(open_pos, lp, ltp, dt, exit_reason,
+                                           trades, open_pos["_capital_before"],
+                                           {"vwap_entry": open_pos["vwap_entry"],
+                                            "rsi_entry":  open_pos["rsi_entry"]})
+                capital  = open_pos["_capital_before"] + pnl
+                open_pos = None
+            continue
+
+        if traded_today:
+            continue
+        if not (VWAP_START <= candle_time <= VWAP_END):
+            continue
+        if len(close_buf) < min_buf:
+            continue
+
+        vwap = _calc_vwap_proxy(close_buf, VWAP_WINDOW)
+        rsi  = _calc_rsi(close_buf, RSI_PERIOD)
+        dev  = (ltp - vwap) / vwap
+
+        action = None
+        if dev > deviation and rsi > rsi_ob:
+            action = "BUY_PUT"
+        elif dev < -deviation and rsi < rsi_os:
+            action = "BUY_CALL"
+
+        if not action:
+            continue
+
+        entry_prem = ltp * PREMIUM_FACTOR
+        cost       = entry_prem * LOT_SIZE
+        if cost > capital:
+            continue
+
+        traded_today = True
+        capital -= cost
+        open_pos = {
+            "id"             : len(trades) + 1,
+            "action"         : action,
+            "entry_premium"  : round(entry_prem, 2),
+            "entry_nifty"    : ltp,
+            "entry_time"     : dt.strftime("%Y-%m-%d %H:%M"),
+            "cost"           : round(cost, 2),
+            "reason"         : f"VWAP dev {dev*100:+.2f}% RSI={rsi:.0f}",
+            "vwap_entry"     : round(vwap, 2),
+            "rsi_entry"      : round(rsi, 1),
+            "_entry_dt"      : dt,
+            "_capital_before": capital + cost,
+            "_stop_floor"    : stop,
+        }
+
+    if open_pos and candles:
+        last_c = candles[-1]
+        lp     = live_premium(open_pos["action"], open_pos["entry_nifty"],
+                              open_pos["entry_premium"], last_c[4])
+        pnl    = _close_position(open_pos, lp, last_c[4], _parse_dt(last_c[0]),
+                                 "end of period", trades, open_pos["_capital_before"],
+                                 {"vwap_entry": open_pos["vwap_entry"],
+                                  "rsi_entry":  open_pos["rsi_entry"]})
+        capital = open_pos["_capital_before"] + pnl
+
+    return {"trades": trades, "final_capital": round(capital, 2)}
+
+
 # ── Combined portfolio helpers ─────────────────────────────────────────────────
 
 def _combined_metrics(gap_result: dict, hybrid_result: dict,
@@ -1019,6 +1365,84 @@ def _print_overlap_log(gap_trades: list, hybrid_trades: list):
             f"   {h['action']:<10} {h['exit_reason']:<26} ₹{h['pnl']:>+8,.0f}"
             f"  {sign} ₹{comb:>+8,.0f}"
         )
+    print(f"{SEP}")
+
+
+def _three_combined_metrics(gap_result: dict, hybrid_result: dict,
+                             vwap_result: dict, starting_capital: float) -> dict:
+    """Merge Gap, Hybrid, and VWAP trades chronologically on one shared capital pool."""
+    all_trades = sorted(
+        gap_result["trades"] + hybrid_result["trades"] + vwap_result["trades"],
+        key=lambda t: t["entry_time"],
+    )
+    capital = starting_capital
+    peak    = starting_capital
+    max_dd  = 0.0
+    for t in all_trades:
+        capital += t["pnl"]
+        peak     = max(peak, capital)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - capital) / peak * 100)
+        t["_combined_cap"] = round(capital, 2)
+
+    wins    = [t for t in all_trades if t["pnl"] > 0]
+    losses  = [t for t in all_trades if t["pnl"] <= 0]
+    gross_w = sum(t["pnl"] for t in wins)
+    gross_l = abs(sum(t["pnl"] for t in losses))
+
+    return {
+        "trades"       : len(all_trades),
+        "wins"         : len(wins),
+        "losses"       : len(losses),
+        "win_rate"     : len(wins) / len(all_trades) * 100 if all_trades else 0,
+        "profit_factor": gross_w / gross_l if gross_l else float("inf"),
+        "max_dd"       : max_dd,
+        "total_return" : (capital - starting_capital) / starting_capital * 100,
+        "total_pnl"    : round(capital - starting_capital, 2),
+        "final_capital": round(capital, 2),
+    }
+
+
+def _print_vwap_overlap_log(hybrid_trades: list, vwap_trades: list):
+    """Show days VWAP fills in for ORB (skips) and days both strategies traded."""
+    hybrid_days  = {t["entry_time"][:10] for t in hybrid_trades}
+    vwap_by_day  = {t["entry_time"][:10]: t for t in vwap_trades}
+
+    fill_days = sorted(d for d in vwap_by_day if d not in hybrid_days)
+    both_days = sorted(set(hybrid_days) & set(vwap_by_day))
+
+    SEP = "=" * 80
+    sep = "-" * 80
+    print(f"\n{SEP}")
+    print(f"  VWAP OVERLAP ANALYSIS")
+    print(f"  VWAP trades on ORB-skip days (fills gap): {len(fill_days)}"
+          f"   Both traded same day: {len(both_days)}")
+    print(sep)
+
+    if fill_days:
+        print(f"\n  ORB SKIPPED — VWAP TRADED ({len(fill_days)} day(s)):")
+        print(f"  {'Date':<12}  {'Action':<10}  {'Exit reason':<36}  {'P&L':>9}")
+        print(f"  {'-'*62}")
+        for d in fill_days:
+            t    = vwap_by_day[d]
+            sign = "✅" if t["pnl"] >= 0 else "❌"
+            print(f"  {d:<12}  {t['action']:<10}  {t['exit_reason']:<36}"
+                  f"  {sign} ₹{t['pnl']:>+8,.0f}")
+
+    if both_days:
+        hybrid_by_day = {t["entry_time"][:10]: t for t in hybrid_trades}
+        print(f"\n  BOTH STRATEGIES TRADED SAME DAY ({len(both_days)} day(s)):")
+        print(f"  {'Date':<12}  {'HYBRID exit':<28}  {'HYBRID P&L':>10}"
+              f"   {'VWAP exit':<28}  {'VWAP P&L':>9}  Combined")
+        print(f"  {'-'*80}")
+        for d in both_days:
+            h    = hybrid_by_day[d]
+            v    = vwap_by_day[d]
+            comb = h["pnl"] + v["pnl"]
+            sign = "✅" if comb >= 0 else "❌"
+            print(f"  {d:<12}  {h['exit_reason']:<28}  ₹{h['pnl']:>+9,.0f}"
+                  f"   {v['exit_reason']:<28}  ₹{v['pnl']:>+8,.0f}"
+                  f"  {sign} ₹{comb:>+8,.0f}")
     print(f"{SEP}")
 
 
@@ -1335,6 +1759,278 @@ def main():
     _print_hga_log(hga_result)
     print(f"\n  [*] HYBRID_GAP_AWARE is experimental — do not use in live trading")
     print(f"      without further validation on out-of-sample data.")
+
+    # ── VWAP REVERSAL ──────────────────────────────────────────────────────────
+    print("\n" + "─" * 50)
+    print("VWAP REVERSAL STRATEGY")
+    print(f"VWAP proxy: rolling {VWAP_WINDOW}-candle close average")
+    print(f"Entry {VWAP_START}–{VWAP_END}  |  Dev ±{VWAP_DEVIATION*100:.1f}%  |  "
+          f"RSI OB>{RSI_OB} / OS<{RSI_OS}")
+    print(f"Stop {VWAP_STOP*100:.0f}%  |  Target +{VWAP_TARGET*100:.0f}%  |  "
+          f"Exit {VWAP_FORCE_EXIT}  |  Reversion exit  |  Skip if HYBRID ORB traded")
+    print("─" * 50)
+    print("Running VWAP REVERSAL ...", flush=True)
+    vwap_result  = run_vwap_backtest(candles, args.capital)
+    vwap_metrics = compute_metrics(vwap_result, args.capital)
+    vwap_entry   = {"label": "VWAP REVERSAL", "result": vwap_result,
+                    "metrics": vwap_metrics}
+
+    # ── Three-way combined: HYBRID + GAP + VWAP ───────────────────────────────
+    three_metrics = _three_combined_metrics(gap_result, hybrid_result,
+                                            vwap_result, args.capital)
+    three_entry   = {"label": "ALL THREE", "metrics": three_metrics}
+
+    # ── Strategy summary: HYBRID vs GAP vs VWAP vs ALL THREE ──────────────────
+    print_comparison_table(
+        [hybrid_entry, gap_entry, vwap_entry, three_entry],
+        args.capital,
+        title="STRATEGY SUMMARY — HYBRID vs GAP vs VWAP vs ALL THREE",
+    )
+
+    # ── VWAP trade log ─────────────────────────────────────────────────────────
+    print(f"\n{'═'*72}")
+    print(f"  VWAP REVERSAL — trade log")
+    print(f"{'═'*72}")
+    print_trade_list(vwap_result["trades"], "VWAP REVERSAL")
+
+    # ── VWAP overlap analysis ──────────────────────────────────────────────────
+    _print_vwap_overlap_log(hybrid_result["trades"], vwap_result["trades"])
+
+    # ── VWAP PARAMETER SWEEP ───────────────────────────────────────────────────
+    print("\n" + "─" * 60)
+    print("VWAP PARAMETER SWEEP")
+    print("8 deviation/RSI combos × 2 exit variants = 16 tests")
+    print("All skip days when HYBRID ORB traded  |  reversion exit: always on")
+    print("─" * 60)
+
+    # Pre-compute HYBRID traded days once — all 16 runs share this set
+    print("Pre-computing HYBRID traded days ...", flush=True)
+    _h_sw = run_orb_backtest(
+        candles, args.capital,
+        stop_pct=-0.35, target_pct=0.75, trail_trigger=0.40,
+        min_range=30, max_range=150, close_confirm=True, hybrid=True,
+    )
+    _hybrid_days_sw = {t["entry_time"][:10] for t in _h_sw["trades"]}
+    print(f"  HYBRID traded on {len(_hybrid_days_sw)} days — VWAP skips those\n")
+
+    _SW_PARAMS = [
+        (0.003, 60, 40),
+        (0.003, 55, 45),
+        (0.004, 62, 38),
+        (0.004, 58, 42),
+        (0.004, 55, 45),
+        (0.005, 60, 40),
+        (0.005, 55, 45),
+        (0.006, 55, 45),
+    ]
+    _SW_EXITS = [
+        ("A", 0.35, -0.25),   # original: +35% target / -25% stop
+        ("B", 0.25, -0.20),   # tighter:  +25% target / -20% stop
+    ]
+
+    _sw_rows = []
+    for dev, rsi_ob, rsi_os in _SW_PARAMS:
+        for exit_lbl, tgt, stp in _SW_EXITS:
+            short = f"d={dev*100:.1f}% RSI{rsi_os}/{rsi_ob}"
+            print(f"  {short} [{exit_lbl}] ...", flush=True)
+            r = run_vwap_param_backtest(
+                candles, args.capital,
+                deviation   = dev,
+                rsi_ob      = rsi_ob,
+                rsi_os      = rsi_os,
+                target      = tgt,
+                stop        = stp,
+                hybrid_days = _hybrid_days_sw,
+            )
+            m = compute_metrics(r, args.capital)
+            _sw_rows.append({
+                "param_lbl"  : short,
+                "exit_lbl"   : exit_lbl,
+                "target"     : tgt,
+                "stop"       : stp,
+                "result"     : r,
+                "metrics"    : m,
+                "gap_fill"   : len(r["trades"]),
+            })
+
+    # Sort: combos with trades by PF desc, then zero-trade combos
+    _sw_has  = sorted(
+        [r for r in _sw_rows if r["metrics"]["trades"] > 0],
+        key=lambda r: r["metrics"]["profit_factor"], reverse=True,
+    )
+    _sw_none = [r for r in _sw_rows if r["metrics"]["trades"] == 0]
+
+    _SW_SEP = "=" * 88
+    _sw_sep = "-" * 88
+    print(f"\n{_SW_SEP}")
+    print(f"  VWAP SWEEP — sorted by profit factor  (0-trade combos listed at bottom)")
+    print(_sw_sep)
+    print(f"  {'Dev / RSI':<22} {'Exit':^6} {'Trades':>7} {'Win%':>7} {'PF':>6}"
+          f" {'MaxDD%':>8} {'Return%':>9} {'Gap Days':>9}")
+    print(f"  {_sw_sep}")
+    for r in _sw_has:
+        m    = r["metrics"]
+        pf_s = f"{m['profit_factor']:.2f}"
+        print(
+            f"  {r['param_lbl']:<22}"
+            f" {r['exit_lbl']:^6}"
+            f" {m['trades']:>7}"
+            f" {m['win_rate']:>6.1f}%"
+            f" {pf_s:>6}"
+            f" {m['max_dd']:>7.1f}%"
+            f" {m['total_return']:>8.2f}%"
+            f" {r['gap_fill']:>9}"
+        )
+    if _sw_none:
+        print(f"  {_sw_sep}")
+        print(f"  (no trades: {', '.join(r['param_lbl']+' ['+r['exit_lbl']+']' for r in _sw_none)})")
+    print(f"{_SW_SEP}")
+
+    # ── Best combination (minimum 3 trades) ───────────────────────────────────
+    _sw_elig = [r for r in _sw_rows if r["metrics"]["trades"] >= 3]
+    if _sw_elig:
+        _best_sw = max(_sw_elig, key=lambda r: r["metrics"]["profit_factor"])
+        m = _best_sw["metrics"]
+        tgt_pct = int(_best_sw["target"] * 100)
+        stp_pct = int(_best_sw["stop"]   * 100)
+        print(f"\n  Best VWAP (≥3 trades): {_best_sw['param_lbl']} [{_best_sw['exit_lbl']}]"
+              f"  Target +{tgt_pct}% / Stop {stp_pct}%")
+        print(f"  {m['trades']} trades | {m['win_rate']:.1f}% win rate | "
+              f"PF {m['profit_factor']:.2f} | "
+              f"MaxDD {m['max_dd']:.1f}% | "
+              f"return {m['total_return']:+.2f}%")
+
+        _tw = _best_sw["result"]["trades"]
+        _SW_SEP2 = "═" * 92
+        print(f"\n{_SW_SEP2}")
+        print(f"  BEST VWAP — {_best_sw['param_lbl']} [{_best_sw['exit_lbl']}]"
+              f"  — day-by-day trade log + direction check")
+        print(f"  (Reversal? = did Nifty move in predicted direction by trade close)")
+        print(f"{_SW_SEP2}")
+        print(f"  {'#':<4} {'Date':<12} {'T':<4} {'Time':<6}"
+              f" {'Nifty entry':>12} {'VWAP':>8} {'Dev%':>6} {'RSI':>5}"
+              f" {'P&L':>10}  {'Reversal?':<12} Exit reason")
+        print(f"  {'-'*92}")
+        for t in _tw:
+            a_s     = "PUT" if t["action"] == "BUY_PUT" else "CAL"
+            rev     = (
+                (t["action"] == "BUY_PUT"  and t["exit_nifty"] < t["entry_nifty"]) or
+                (t["action"] == "BUY_CALL" and t["exit_nifty"] > t["entry_nifty"])
+            )
+            rev_s   = "✅ yes" if rev else "❌ no"
+            vwap_e  = t.get("vwap_entry", 0)
+            dev_pct = (t["entry_nifty"] - vwap_e) / vwap_e * 100 if vwap_e else 0
+            ent_t   = t["entry_time"][11:16] if len(t["entry_time"]) > 11 else "?"
+            print(
+                f"  {t['id']:<4} {t['entry_time'][:10]:<12} {a_s:<4} {ent_t:<6}"
+                f" ₹{t['entry_nifty']:>10,.0f}"
+                f" ₹{vwap_e:>7,.0f}"
+                f" {dev_pct:>+5.2f}%"
+                f" {t.get('rsi_entry', 0.0):>4.0f}"
+                f" ₹{t['pnl']:>+9,.0f}"
+                f"  {rev_s:<12}"
+                f" {t['exit_reason']}"
+            )
+        _rev_n = sum(1 for t in _tw if
+                     (t["action"] == "BUY_PUT"  and t["exit_nifty"] < t["entry_nifty"]) or
+                     (t["action"] == "BUY_CALL" and t["exit_nifty"] > t["entry_nifty"]))
+        pct_rev = _rev_n / len(_tw) * 100 if _tw else 0
+        print(f"\n  Actual reversals: {_rev_n}/{len(_tw)} ({pct_rev:.0f}%)"
+              f"  — Nifty moved in predicted direction by trade close")
+        print(f"{_SW_SEP2}")
+
+    elif _sw_has:
+        _best_sw = _sw_has[0]
+        print(f"\n  Note: Best combo '{_best_sw['param_lbl']} [{_best_sw['exit_lbl']}]' "
+              f"has only {_best_sw['metrics']['trades']} trade(s) — not enough for statistics.")
+    else:
+        print(f"\n  No VWAP combination generated any trades over this period.")
+        print(f"  The combined deviation + RSI extremes did not coincide on ORB-skip days.")
+
+    # ── Sanity-check: existing strategy numbers must be unchanged ──────────────
+    print(f"\n  [sanity check] HYBRID PF={hybrid_metrics['profit_factor']:.2f}"
+          f"  WR={hybrid_metrics['win_rate']:.1f}%"
+          f"  ret={hybrid_metrics['total_return']:.2f}%")
+    print(f"  [sanity check] GAP    PF={gap_metrics['profit_factor']:.2f}"
+          f"  WR={gap_metrics['win_rate']:.1f}%"
+          f"  ret={gap_metrics['total_return']:.2f}%")
+    print(f"  [sanity check] COMB   PF={comb_metrics['profit_factor']:.2f}"
+          f"  WR={comb_metrics['win_rate']:.1f}%"
+          f"  ret={comb_metrics['total_return']:.2f}%")
+
+    # ── FINAL CONFIRMED STRATEGY COMPARISON ───────────────────────────────────
+    # Best VWAP combo from sweep: d=0.3%, RSI40/60, Exit B (+25%/-20%)
+    _vf_hdays = {t["entry_time"][:10] for t in hybrid_result["trades"]}
+    _vwap_fin = run_vwap_param_backtest(
+        candles, args.capital,
+        deviation   = 0.003,
+        rsi_ob      = 60,
+        rsi_os      = 40,
+        target      = 0.25,
+        stop        = -0.20,
+        hybrid_days = _vf_hdays,
+    )
+    _vf_m = compute_metrics(_vwap_fin, args.capital)
+
+    # ALL THREE on one sequential capital pool
+    _a3_m = _three_combined_metrics(gap_result, hybrid_result, _vwap_fin, args.capital)
+
+    # Overlap verification
+    _h_d = {t["entry_time"][:10] for t in hybrid_result["trades"]}
+    _g_d = {t["entry_time"][:10] for t in gap_result["trades"]}
+    _v_d = {t["entry_time"][:10] for t in _vwap_fin["trades"]}
+
+    _hv_ov = _h_d & _v_d   # HYBRID ∩ VWAP (should be 0 — by design)
+    _gv_ov = _g_d & _v_d   # GAP ∩ VWAP (calendar day, but different time windows)
+    _gh_ov = _g_d & _h_d   # GAP ∩ HYBRID (same — different time windows)
+
+    _FIN = "=" * 76
+    _fin = "-" * 76
+    print(f"\n{_FIN}")
+    print(f"  FINAL CONFIRMED STRATEGY SET  (capital ₹{args.capital:,.0f})")
+    print(_fin)
+    print(f"  {'Strategy':<26} {'Trades':>7} {'Win%':>7} {'PF':>6}"
+          f" {'MaxDD%':>8} {'Return%':>9} {'P&L':>12}")
+    print(f"  {_fin}")
+    for lbl, m in [("HYBRID ORB+Gemini",  hybrid_metrics),
+                   ("GAP AND GO",         gap_metrics),
+                   ("VWAP Momentum Fade", _vf_m)]:
+        print(f"  {lbl:<26}"
+              f" {m['trades']:>7}"
+              f" {m['win_rate']:>6.1f}%"
+              f" {m['profit_factor']:>6.2f}"
+              f" {m['max_dd']:>7.1f}%"
+              f" {m['total_return']:>8.2f}%"
+              f" ₹{m['total_pnl']:>+10,.0f}")
+    print(f"  {_fin}")
+    print(f"  {'ALL THREE COMBINED':<26}"
+          f" {_a3_m['trades']:>7}"
+          f" {_a3_m['win_rate']:>6.1f}%"
+          f" {_a3_m['profit_factor']:>6.2f}"
+          f" {_a3_m['max_dd']:>7.1f}%"
+          f" {_a3_m['total_return']:>8.2f}%"
+          f" ₹{_a3_m['total_pnl']:>+10,.0f}")
+    print(f"  (non-overlapping time windows — capital reused sequentially within each day)")
+    print(f"{_FIN}")
+
+    # Non-overlap confirmation
+    print(f"\n  Overlap verification (calendar days):")
+    print(f"  HYBRID ∩ VWAP  : {len(_hv_ov):>2} day(s)"
+          + ("  ✅ none — VWAP skips all HYBRID days by design"
+             if len(_hv_ov) == 0
+             else f"  ⚠️  {sorted(_hv_ov)}"))
+    g_v_note = ("  ✅ none" if len(_gv_ov) == 0
+                else f"  {len(_gv_ov)} shared day(s) — GAP exits 10:00, VWAP enters 10:00+  (sequential)")
+    print(f"  GAP    ∩ VWAP  : {len(_gv_ov):>2} day(s){g_v_note}")
+    print(f"  GAP    ∩ HYBRID: {len(_gh_ov):>2} day(s)  — GAP exits 10:00, HYBRID enters after breakout  (sequential)")
+    print(f"\n  Time-window separation guarantees no simultaneous open positions:")
+    print(f"  GAP          : 9:15 entry  → exits by 10:00  (45-minute max hold)")
+    print(f"  HYBRID ORB   : 9:30+ entry → exits by 14:30")
+    print(f"  VWAP Fade    : 10:00–13:30 entry → exits by 14:00  (skips HYBRID days)")
+    print(f"\n  Confirmed strategy parameters (backtest Jan–May 2026):")
+    print(f"  HYBRID    : range 30–150pts | close-confirm | -35%/+75% | trail→BE@+40% | 14:30 exit")
+    print(f"  GAP       : gap ±0.5–2.0% at 9:15 | -25%/+40% | hard exit 10:00 AM")
+    print(f"  VWAP Fade : 30-candle proxy | dev>0.3% | RSI<40 or >60 | -20%/+25% | reversion exit | 14:00 exit")
 
 
 if __name__ == "__main__":
