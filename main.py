@@ -14,8 +14,14 @@ _limit_notified: set = set()
 STRATEGY_MODE = "HYBRID"
 
 # ── ORB exit parameters (used by run_signal in market_feed.py) ─────────────────
-ORB_PROFIT_TARGET =  75   # %  — close at +75% premium gain
-ORB_STOP_LOSS     = -35   # %  — close at -35% premium loss
+ORB_PROFIT_TARGET  =  75   # %  — close at +75% premium gain
+ORB_STOP_LOSS      = -35   # %  — close at -35% premium loss
+
+VWAP_PROFIT_TARGET =  25   # %  — VWAP reversal: close at +25% premium gain  (sweep best: Exit B)
+VWAP_STOP_LOSS     = -20   # %  — VWAP reversal: close at -20% premium loss  (sweep best: Exit B)
+VWAP_DEVIATION     = 0.003 # price vs 30-candle VWAP proxy threshold
+VWAP_RSI_OB        = 60    # RSI overbought threshold (fade UP)
+VWAP_RSI_OS        = 40    # RSI oversold threshold  (fade DOWN)
 
 risk = RiskManager(
     max_daily_loss=5000,      # one bad trade shouldn't end the day
@@ -256,6 +262,89 @@ def on_gap_signal(gap_pct: float, market_data: dict):
 
     if _mf:
         _mf.state["gap_status"] = f"TRADED — {action}"
+
+    return {"signal": signal, "option_data": option_data}
+
+
+def on_vwap_signal(vwap: float, ltp: float, rsi: float, market_data: dict):
+    """VWAP Reversal: fade overbought/oversold deviations from rolling VWAP."""
+    try:
+        import market_feed as mf
+        _mf = mf
+    except ImportError:
+        _mf = None
+
+    dev = (ltp - vwap) / vwap
+    if dev > VWAP_DEVIATION and rsi > VWAP_RSI_OB:
+        action    = "BUY_PUT"
+        direction = "UP"
+    elif dev < -VWAP_DEVIATION and rsi < VWAP_RSI_OS:
+        action    = "BUY_CALL"
+        direction = "DOWN"
+    else:
+        return None
+
+    if action == "BUY_CALL":
+        premium = market_data.get("option_premium_ce") or market_data.get("option_premium", 100)
+        strike  = market_data.get("ce_strike")
+        symbol  = market_data.get("ce_symbol", "")
+    else:
+        premium = market_data.get("option_premium_pe") or market_data.get("option_premium", 100)
+        strike  = market_data.get("pe_strike")
+        symbol  = market_data.get("pe_symbol", "")
+
+    if _mf:
+        if action == "BUY_CALL":
+            premium = _mf.state.get("ce_premium") or premium
+            strike  = _mf.state.get("ce_strike")  or strike
+            symbol  = _mf.state.get("ce_symbol")  or symbol
+        else:
+            premium = _mf.state.get("pe_premium") or premium
+            strike  = _mf.state.get("pe_strike")  or strike
+            symbol  = _mf.state.get("pe_symbol")  or symbol
+
+    inst_key = None
+    if _mf:
+        inst_key = (_mf.state.get("ce_instrument") if action == "BUY_CALL"
+                    else _mf.state.get("pe_instrument"))
+
+    signal = {
+        "action"        : action,
+        "strike"        : strike,
+        "reason"        : f"VWAP dev {dev*100:+.2f}% RSI={rsi:.0f} — fade {direction}",
+        "confidence"    : "HIGH",
+        "source"        : "vwap_reversal",
+        "trading_symbol": symbol,
+        "instrument_key": inst_key,
+    }
+    option_data = {
+        "premium"       : premium,
+        "strike"        : strike,
+        "trading_symbol": symbol,
+        "instrument_key": inst_key,
+    }
+
+    approval = risk.approve_trade(signal, premium, 65)
+    if not approval["approved"]:
+        log(f"🚫 {approval['reason']}")
+        reason = approval["reason"]
+        if any(k in reason for k in ("loss limit", "trades/day", "1 trade")):
+            if reason not in _limit_notified:
+                _limit_notified.add(reason)
+                notifier.notify_limit_hit(reason, load_ledger().get("total_pnl", 0))
+        return None
+
+    log(f"🔔 VWAP {direction} dev={dev*100:+.2f}% RSI={rsi:.0f}: {action} {symbol} ₹{premium:.0f}")
+    notifier.notify_signal(action, symbol, premium, "HIGH", "vwap_reversal")
+    notifier.log_signal(
+        market_data.get("ltp"),
+        None, None, None,
+        action, strike, "HIGH", f"VWAP dev {dev*100:+.2f}% RSI={rsi:.0f}",
+    )
+
+    if _mf:
+        _mf.state["vwap_signal"] = action
+        _mf.state["vwap_status"] = f"SIGNAL {action} dev={dev*100:+.2f}% RSI={rsi:.0f}"
 
     return {"signal": signal, "option_data": option_data}
 

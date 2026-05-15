@@ -179,16 +179,19 @@ state = {
 ## Trading Strategy Context
 
 ### Strategy Mode (`main.py: STRATEGY_MODE`)
-Three modes selectable at the top of `main.py`:
-- **`"HYBRID"`** (default, live-ready) — ORB breakout entry + Gemini must confirm direction. Backtested PF 1.50, win rate 56.2%, max DD 14.0%, return +29.74% on 48 trades (Jan–May 2026). **Confirmed primary strategy.**
-- **`"ORB"`** — ORB breakout only, no Gemini confirmation. Backtested PF 1.25, win rate 53.1%, 64 trades.
+Four modes selectable at the top of `main.py`:
+- **`"HYBRID"`** (default, live-ready) — ORB breakout entry + Gemini must confirm direction. Backtested PF 1.50, WR 56.2%, +29.74% on 48 trades (Jan–May 2026). **Confirmed primary strategy.**
+- **`"ORB"`** — ORB breakout only, no Gemini confirmation. Backtested PF 1.25, WR 53.1%, 64 trades.
+- **`"VWAP_REVERSAL"`** — VWAP Momentum Fade on ORB-skip days. Backtested PF 1.93, WR 62.5%, +5.98% on 16 trades (Jan–May 2026). Complementary to HYBRID — never fires on same days.
 - **`"GEMINI"`** — Legacy mode: Gemini/rule-based signal on change_pct threshold, fires every 60 s.
 
 Signal routing in `run_signal()` (`market_feed.py`):
 ```python
-if strategy_mode == "GEMINI":  result = _main.on_market_data(market_data)
-elif strategy_mode == "ORB":   result = _check_orb_signal(market_data, hybrid=False)
-elif strategy_mode == "HYBRID":result = _check_orb_signal(market_data, hybrid=True)
+if strategy_mode == "GEMINI":         result = _main.on_market_data(market_data)
+elif strategy_mode == "ORB":          result = _check_orb_signal(market_data, hybrid=False)
+elif strategy_mode == "HYBRID":       result = _check_orb_signal(market_data, hybrid=True)
+elif strategy_mode == "GAP_AND_GO":   result = _check_gap_signal(market_data)
+elif strategy_mode == "VWAP_REVERSAL":result = _check_vwap_signal(market_data)
 ```
 
 ### Primary Strategy: ORB / HYBRID (Opening Range Breakout)
@@ -206,6 +209,47 @@ elif strategy_mode == "HYBRID":result = _check_orb_signal(market_data, hybrid=Tr
   - Force-close: any open position is closed at 14:30 (`run_signal` time check)
   - No new entries after 14:30 (`_check_orb_signal` time guard)
   - Manual: X key (exit at current price)
+
+### VWAP Momentum Fade Strategy (`STRATEGY_MODE = "VWAP_REVERSAL"`)
+Fires on ORB-skip days only (guaranteed non-overlapping with HYBRID).
+
+**Confirmed parameters (backtested Jan–May 2026, parameter sweep):**
+- VWAP proxy: rolling 30-candle (30-minute) mean of Nifty LTP ticks
+- RSI: Wilder smoothing, 14-period
+- Entry window: 10:00–13:30 (skip before 10:00 — too close to open; skip after 13:30 — theta risk)
+- Entry condition: `dev > 0.3% AND RSI > 60` → BUY_PUT (fade overbought extension)
+- Entry condition: `dev < -0.3% AND RSI < 40` → BUY_CALL (fade oversold extension)
+- Skip if `orb_traded_today` is True (ORB/HYBRID took a trade)
+- One trade per day maximum (`vwap_traded` flag)
+- Stop: −20% (`VWAP_STOP_LOSS`)
+- Target: +25% (`VWAP_PROFIT_TARGET`)
+- Reversion exit: if price crosses back through VWAP while not in loss (pct > −5%), exit
+- Force-close: 14:00 (`run_signal` time check)
+- Manual: X key (exit at current price)
+
+**Constants in `main.py`:**
+```python
+VWAP_PROFIT_TARGET =  25   # %
+VWAP_STOP_LOSS     = -20   # %
+VWAP_DEVIATION     = 0.003 # 0.3% from 30-candle mean
+VWAP_RSI_OB        = 60    # fade when RSI > this
+VWAP_RSI_OS        = 40    # fade when RSI < this
+```
+
+**State keys (market_feed.py):**
+```python
+"vwap"           : float,   # current 30-candle VWAP proxy
+"rsi"            : float,   # current RSI(14)
+"vwap_deviation" : float,   # (ltp - vwap) / vwap
+"vwap_signal"    : str,     # BUY_CALL / BUY_PUT / None
+"vwap_traded"    : bool,    # True once trade or skip-decision made today
+"vwap_status"    : str,     # WAITING / COMPUTING / WATCHING / TRADED / SKIP
+```
+
+**Backtested results (Jan–May 2026, d=0.3%, RSI 40/60, Exit B +25%/−20%):**
+- 16 trades, WR 62.5%, PF 1.93, MaxDD 3.2%, +5.98%
+- HYBRID∩VWAP overlap = 0 days (confirmed non-overlapping by design)
+- ALL THREE COMBINED (GAP + HYBRID + VWAP): 94 trades, WR 54.3%, PF 1.38, MaxDD 12.1%, +38.19%
 
 ### Legacy Strategy: Gemini Directional
 - Buy ATM or near-ATM call/put based on Gemini signal
