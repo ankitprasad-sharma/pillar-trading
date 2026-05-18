@@ -27,6 +27,36 @@ def save_ledger(ledger: dict):
         json.dump(ledger, f, indent=2)
 
 
+def _resolve_contract(signal: dict, market_data: dict) -> tuple:
+    """Return (instrument_key, trading_symbol, strike), looking up option chain if needed."""
+    instrument_key = signal.get("instrument_key") or ""
+    trading_symbol = signal.get("trading_symbol") or ""
+    strike         = signal.get("strike") or None
+
+    if instrument_key and trading_symbol and strike:
+        return instrument_key, trading_symbol, strike
+
+    try:
+        from option_chain import get_all_contracts, get_nearest_expiry
+        opt_type      = "CE" if signal["action"] == "BUY_CALL" else "PE"
+        ltp           = market_data.get("ltp", 0)
+        lookup_strike = float(strike) if strike else round(ltp / 50) * 50
+        contracts     = get_all_contracts()
+        expiry        = get_nearest_expiry()
+        match = next((c for c in contracts
+                      if c["expiry"] == expiry
+                      and c["instrument_type"] == opt_type
+                      and c["strike_price"] == lookup_strike), None)
+        if match:
+            print(f"🔍 Resolved contract: {match['trading_symbol']} ({match['instrument_key']})")
+            return match["instrument_key"], match["trading_symbol"], int(match["strike_price"])
+        print(f"❌ No {opt_type} contract found for strike {lookup_strike} expiry {expiry}")
+    except Exception as e:
+        print(f"⚠️  Contract lookup failed: {e}")
+
+    return instrument_key, trading_symbol, strike
+
+
 def open_trade(signal: dict, market_data: dict) -> dict:
     ledger = load_ledger()
 
@@ -42,12 +72,21 @@ def open_trade(signal: dict, market_data: dict) -> dict:
         print(f"❌ Insufficient capital: ₹{ledger['capital']:.2f} available, ₹{cost} needed")
         return ledger
 
+    instrument_key, trading_symbol, strike = _resolve_contract(signal, market_data)
+
+    if not instrument_key:
+        msg = f"instrument_key missing for {signal.get('action')} — trade blocked"
+        print(f"❌ {msg}")
+        if _notifier:
+            _notifier.notify_error(msg)
+        return ledger
+
     trade = {
         "id": len(ledger["trades"]) + 1,
         "action": signal["action"],
-        "strike": signal.get("strike", "N/A"),
-        "trading_symbol": signal.get("trading_symbol", ""),
-        "instrument_key": signal.get("instrument_key", ""),
+        "strike": strike,
+        "trading_symbol": trading_symbol,
+        "instrument_key": instrument_key,
         "entry_premium": premium,
         "quantity": quantity,
         "cost": cost,

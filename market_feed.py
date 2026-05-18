@@ -9,6 +9,7 @@ import select
 import termios
 import tty
 from datetime import datetime
+import pytz
 from dotenv import load_dotenv
 import upstox_client
 from upstox_client import MarketDataStreamerV3
@@ -29,6 +30,32 @@ B  = "\033[1m";  X  = "\033[0m"
 def clr():
     sys.stdout.write("\033[H\033[J")
     sys.stdout.flush()
+
+
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def is_market_open() -> bool:
+    from datetime import time as _time
+    now = datetime.now(_IST)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    t = now.time()
+    return _time(9, 15) <= t <= _time(15, 30)
+
+
+def _next_open_str() -> str:
+    from datetime import time as _time
+    now  = datetime.now(_IST)
+    wday = now.weekday()            # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    t    = now.time()
+    if wday >= 5 or (wday == 4 and t > _time(15, 30)):
+        return "Opens Monday 9:15 AM"
+    elif t < _time(9, 15):
+        return "Opens 9:15 AM"
+    else:
+        return "Opens tomorrow 9:15 AM"
+
 
 state = {
     "prev_close"      : None,
@@ -80,8 +107,9 @@ state = {
     "vwap_status"     : "WAITING",   # WAITING / COMPUTING / WATCHING / SIGNAL / TRADED / SKIPPED
 }
 
-_draw_lock      = threading.Lock()
-_signal_lock    = threading.Lock()
+_draw_lock            = threading.Lock()
+_signal_lock          = threading.Lock()
+_token_error_notified = [False]   # suppress repeated 401 Telegram alerts
 _streamer       = None
 _last_draw      = 0
 _last_tick_time = time.time()   # updated on every real WS message
@@ -110,21 +138,40 @@ def _compute_rsi(closes: list, period: int = 14) -> float:
 
 
 def heartbeat_loop():
-    """Every 10s: update timestamp + poll position price if no recent tick"""
+    """Every 10s (market open) or 60s (market closed): timestamp + optional poll."""
     import requests, os
-    last_pos_tick = [time.time()]
+    last_pos_tick  = [time.time()]
+    _prev_mkt_open = None   # tracks last known state for transition messages
 
     while state["running"]:
-        time.sleep(10)
+        mkt_open = is_market_open()
+
+        # Fire one log message on each open/close transition
+        if _prev_mkt_open is not None and mkt_open != _prev_mkt_open:
+            if mkt_open:
+                add_log("🟢 Market open — resuming live feed")
+            else:
+                add_log("🔴 Market closed — system idle until 9:15 AM")
+                state["market_status"] = "MARKET CLOSED"
+        _prev_mkt_open = mkt_open
+
+        time.sleep(10 if mkt_open else 60)
+
         if state["paused"]:
             continue
 
-        # Check if feed is stale (no tick in 60s)
+        state["last_update"] = datetime.now().strftime("%H:%M:%S") + " ✓"
+
+        if not mkt_open:
+            draw()
+            continue
+
+        # ── Market-hours-only checks ─────────────────────────────────────────
+        # Stale feed: no WebSocket tick in 60s during market hours
         last_tick_age = time.time() - _last_tick_time
         if last_tick_age > 60:
             state["market_status"] = "FEED STALE — reconnecting"
             add_log("⚠️  No ticks in 60s — token may be expired")
-        state["last_update"] = datetime.now().strftime("%H:%M:%S") + " ✓"
 
         # Poll position price if WebSocket tick is stale (>30s)
         inst = state.get("pos_instrument")
@@ -147,7 +194,7 @@ def heartbeat_loop():
             except Exception:
                 pass
 
-        # Also poll ATM if stale
+        # Poll ATM premiums if stale
         ce_inst = state.get("ce_instrument")
         pe_inst = state.get("pe_instrument")
         if ce_inst and pe_inst:
@@ -231,11 +278,10 @@ def fetch_orb_range():
             if traded_today:
                 state["orb_status"] = "WATCHING"
             elif orb_range > 150:
-                state["orb_status"]       = f"SKIP-WIDE ({orb_range:.0f}pt)"
-                state["orb_traded_today"] = True
+                # SKIP — leave orb_traded_today=False so VWAP can fire later
+                state["orb_status"] = f"SKIP-WIDE ({orb_range:.0f}pt)"
             elif orb_range < 30:
-                state["orb_status"]       = f"SKIP-NARROW ({orb_range:.0f}pt)"
-                state["orb_traded_today"] = True
+                state["orb_status"] = f"SKIP-NARROW ({orb_range:.0f}pt)"
             else:
                 state["orb_status"] = "WATCHING"
         else:
@@ -293,6 +339,146 @@ def fetch_prev_close() -> float:
     except Exception as e:
         add_log(f'⚠️  Prev close fetch failed: {e}')
     return None
+
+
+def _notify_and_wait_for_token(env_path: str, age_hours: float):
+    """Send Telegram alert then poll .env every 30s until token refreshed or 9:15 AM."""
+    from dotenv import dotenv_values as _dv
+    from datetime import time as _time
+
+    api_key  = _dv(env_path).get("UPSTOX_API_KEY", "")
+    auth_url = (
+        f"https://api.upstox.com/v2/login/authorization/dialog"
+        f"?client_id={api_key}"
+        f"&redirect_uri=http://127.0.0.1:3000"
+        f"&response_type=code"
+    )
+
+    now_ist      = datetime.now(_IST)
+    market_open  = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    mins_to_open = max(0, int((market_open - now_ist).total_seconds() / 60))
+
+    lbl = f"{age_hours:.0f}h old" if age_hours > 0 else "age unknown"
+    add_log(f"⚠️  Token {lbl} — Telegram alert sent")
+    notifier.notify_token_needed(auth_url, mins_to_open)
+
+    initial_tok_time = float(_dv(env_path).get("UPSTOX_TOKEN_TIME", "0") or "0")
+    urgent_sent      = False
+
+    while state["running"]:
+        now_ist = datetime.now(_IST)
+        cur_t   = now_ist.time()
+
+        # Urgent warning once in the 9:10–9:15 pre-market window
+        if not urgent_sent and _time(9, 10) <= cur_t < _time(9, 15):
+            urgent_sent = True
+            mins_left   = max(0, int(
+                (now_ist.replace(hour=9, minute=15, second=0) - now_ist
+                ).total_seconds() / 60))
+            notifier.notify_token_urgent(mins_left)
+
+        # Re-read .env — detect token saved by upstox_auth.py or /code bot command
+        fresh        = _dv(env_path)
+        new_tok_time = float(fresh.get("UPSTOX_TOKEN_TIME", "0") or "0")
+        if new_tok_time > initial_tok_time:
+            global TOKEN
+            new_token = fresh.get("UPSTOX_ACCESS_TOKEN", "")
+            if new_token:
+                TOKEN = new_token
+                os.environ["UPSTOX_ACCESS_TOKEN"] = new_token
+            _token_error_notified[0] = False    # reset 401 suppression
+            add_log("✅ Token refreshed — ready for trading")
+            notifier.send("✅ *Token refreshed* — system ready for trading")
+            break
+
+        time.sleep(30)
+
+
+def _do_daily_reset():
+    """9:00 AM reset: clear day state, refresh prev_close, reset risk manager."""
+    global _price_buffer, _vwap_day
+    import main as _main
+
+    # Clear all daily strategy flags (mirrors on_message day-boundary reset)
+    today = datetime.now(_IST).strftime("%Y-%m-%d")
+    state["orb_day"]          = today
+    state["orb_high"]         = None
+    state["orb_low"]          = None
+    state["orb_range"]        = None
+    state["orb_status"]       = "BUILDING"
+    state["orb_traded_today"] = False
+    state["orb_locked"]       = False
+    state["orb_signal"]       = None
+    state["orb_trail_active"] = False
+    state["gap_pct"]          = None
+    state["gap_signal"]       = None
+    state["gap_traded"]       = False
+    state["gap_status"]       = "WAITING"
+    state["vwap"]             = None
+    state["rsi"]              = None
+    state["vwap_deviation"]   = None
+    state["vwap_signal"]      = None
+    state["vwap_traded"]      = False
+    state["vwap_status"]      = "WAITING"
+    _price_buffer             = []
+    _vwap_day                 = None
+
+    # Reset risk manager and dedup set
+    _main.risk.reset_daily_counters()
+    _main._limit_notified.clear()
+
+    # Fetch fresh prev_close from historical API
+    pc = fetch_prev_close()
+    if pc:
+        state["prev_close"]        = pc
+        state["prev_close_locked"] = True
+
+    # Check token age using UPSTOX_TOKEN_TIME saved by upstox_auth.py
+    try:
+        from dotenv import dotenv_values as _dv
+        _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        _tok_time = float(_dv(_env_path).get("UPSTOX_TOKEN_TIME", "0") or "0")
+        age_hours = (time.time() - _tok_time) / 3600
+        if _tok_time == 0 or age_hours > 20:
+            _notify_and_wait_for_token(_env_path, age_hours)
+    except Exception as e:
+        add_log(f"⚠️  Token check failed: {e}")
+
+    add_log("📅 Daily reset complete — ready for trading")
+
+
+def daily_reset_loop():
+    """Fire _do_daily_reset() once per weekday at 9:00 AM IST."""
+    from datetime import time as _time
+    _reset_done = [None]    # date string of last completed reset
+
+    while state["running"]:
+        now   = datetime.now(_IST)
+        today = now.strftime("%Y-%m-%d")
+        t     = now.time()
+        if (now.weekday() < 5
+                and _time(9, 0) <= t <= _time(9, 10)
+                and _reset_done[0] != today):
+            _reset_done[0] = today
+            _do_daily_reset()
+        time.sleep(30)
+
+
+def _startup_token_check():
+    """Run once at launch: alert and block if token is missing or >20h old."""
+    from dotenv import dotenv_values as _dv
+    env_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    tok_time  = float(_dv(env_path).get("UPSTOX_TOKEN_TIME", "0") or "0")
+    age_hours = (time.time() - tok_time) / 3600
+
+    if tok_time > 0 and age_hours <= 20:
+        add_log(f"🔑 Token OK ({age_hours:.0f}h old)")
+        return
+
+    lbl = f"{age_hours:.0f}h old" if tok_time > 0 else "never set"
+    add_log(f"⚠️  Token {lbl} — waiting for refresh before connecting")
+    draw()
+    _notify_and_wait_for_token(env_path, age_hours if tok_time > 0 else 999)
 
 
 def add_log(msg):
@@ -353,9 +539,18 @@ def draw():
         lines.append(f"{C}{B}  🚀  PILLAR TRADING{X}  {mode_c}{B}[ {mode_s} ]{X}")
         lines.append(sep)
 
-        msc = G if "OPEN" in state["market_status"] else R
+        mst = state["market_status"]
+        if mst == "MARKET CLOSED" or "CLOSE" in mst.upper():
+            nxt      = _next_open_str()
+            mst_line = f"{D}{B}MARKET CLOSED{X}  {D}{nxt}{X}"
+        elif "OPEN" in mst:
+            mst_line = f"{G}{B}{mst:<18}{X}"
+        elif "CONNECT" in mst:
+            mst_line = f"{Y}{B}{mst:<18}{X}"
+        else:
+            mst_line = f"{R}{B}{mst:<18}{X}"
         lines.append(
-            f"{W}Market: {msc}{B}{state['market_status']:<18}{X}"
+            f"{W}Market: {mst_line}  "
             f"{D}Updated: {state['last_update'] or '---'}{X}"
         )
 
@@ -475,11 +670,15 @@ def draw():
                 f"Strike ₹{int(cur_st) if cur_st else '?'} → ₹{cur_p:.1f}  "
                 f"{uc2}₹{upnl2:+.0f} ({cpct2:+.1f}%){X}"
             )
-            if sm in ("ORB", "HYBRID"):
+            # Route by pos.source so gap trades taken under HYBRID show gap params
+            pos_src = pos.get("source", "")
+            if pos_src == "gap_and_go":
+                params_str = "Stop:-25%  Target:+40%  Force-exit:10:00"
+            elif pos_src == "vwap_reversal" or sm == "VWAP_REVERSAL":
+                params_str = "Stop:-20%  Target:+25%  Force-exit:14:00"
+            elif pos_src in ("orb", "hybrid") or sm in ("ORB", "HYBRID"):
                 trail_tag  = "  Trail:BE@+40% ✓" if state.get("orb_trail_active") else ""
                 params_str = f"Stop:-35%  Target:+75%{trail_tag}  Force-exit:14:30"
-            elif sm == "GAP_AND_GO":
-                params_str = "Stop:-25%  Target:+40%  Force-exit:10:00"
             else:
                 params_str = "Stop:-30%  Target:+50%"
             lines.append(
@@ -595,9 +794,15 @@ def on_message(message):
     msg_type = message.get("type")
 
     if msg_type == "market_info":
-        s = message.get("marketInfo", {}).get("segmentStatus", {})
-        state["market_status"] = s.get("NSE_INDEX", "UNKNOWN")
-        add_log(f"Market: {state['market_status']}")
+        s          = message.get("marketInfo", {}).get("segmentStatus", {})
+        raw_status = s.get("NSE_INDEX", "UNKNOWN")
+        # Map any close variant to a single clean string so heartbeat
+        # doesn't treat it as a stale feed
+        if "CLOSE" in raw_status.upper():
+            state["market_status"] = "MARKET CLOSED"
+        else:
+            state["market_status"] = raw_status
+        add_log(f"Market: {raw_status}")
         draw()
         return
 
@@ -683,11 +888,10 @@ def on_message(message):
                     state["orb_range"]  = _rng
                     state["orb_locked"] = True
                     if _rng > 150:
-                        state["orb_status"]       = f"SKIP-WIDE ({_rng:.0f}pt)"
-                        state["orb_traded_today"] = True
+                        # SKIP — leave orb_traded_today=False so VWAP can fire later
+                        state["orb_status"] = f"SKIP-WIDE ({_rng:.0f}pt)"
                     elif _rng < 30:
-                        state["orb_status"]       = f"SKIP-NARROW ({_rng:.0f}pt)"
-                        state["orb_traded_today"] = True
+                        state["orb_status"] = f"SKIP-NARROW ({_rng:.0f}pt)"
                     else:
                         state["orb_status"] = "WATCHING"
                     add_log(
@@ -766,21 +970,34 @@ def on_message(message):
 
 
 def on_error(m):
-    add_log(f"❌ {str(m)[:55]}")
-    notifier.notify_error(str(m)[:80])
+    err = str(m)
+    if "401" in err or "unauthorized" in err.lower():
+        if not _token_error_notified[0]:
+            _token_error_notified[0] = True
+            add_log("❌ Token expired (401) — refresh needed")
+            notifier.send(
+                "❌ *WebSocket 401 — Token Expired*\n\n"
+                "Refresh options:\n"
+                "• Computer: `python3 upstox_auth.py`\n"
+                "• Phone: send `/token` for instructions"
+            )
+        draw()
+        return
+    add_log(f"❌ {err[:55]}")
+    notifier.notify_error(err[:80])
     draw()
 
 
-def on_close(m):
+def on_close(m, *_):
     add_log("🔌 Disconnected")
     draw()
 
 
 def on_open():
+    # Note: daily counters are reset by daily_reset_loop() at 9:00 AM only.
+    # Resetting on every WebSocket reconnect would let a mid-day disconnect
+    # silently re-enable a second trade after the daily limit had been hit.
     add_log("✅ Connected to Upstox")
-    import main as _main
-    _main.risk.reset_daily_counters()
-    add_log("🔄 Daily risk counters reset")
     draw()
     threading.Thread(target=restore_position_subscription, daemon=True).start()
     # Fetch prev close first, then restore ORB+gap (gap calc needs prev_close)
@@ -871,6 +1088,15 @@ def _check_orb_signal(market_data: dict):
     if not action:
         return None
 
+    # Wait for option data — same safety check as the gap signal path
+    live_ce  = state.get("ce_premium")
+    live_pe  = state.get("pe_premium")
+    ce_inst  = state.get("ce_instrument")
+    pe_inst  = state.get("pe_instrument")
+    if not live_ce or not live_pe or not ce_inst or not pe_inst:
+        add_log(f"⏳ ORB break {action} — waiting for option data...")
+        return None
+
     state["orb_traded_today"] = True
     state["orb_signal"]       = action
     orb_range = orb_high - orb_low
@@ -879,10 +1105,8 @@ def _check_orb_signal(market_data: dict):
     add_log(f"📐 ORB broke {direction} @ ₹{ltp:.0f} ({orb_low:.0f}–{orb_high:.0f})")
 
     strike   = round(ltp / 50) * 50
-    premium  = (state["ce_premium"] if action == "BUY_CALL"
-                else state["pe_premium"]) or ltp * 0.008
-    inst_key = (state.get("ce_instrument") if action == "BUY_CALL"
-                else state.get("pe_instrument"))
+    premium  = live_ce if action == "BUY_CALL" else live_pe
+    inst_key = ce_inst if action == "BUY_CALL" else pe_inst
     sym      = (state.get("ce_symbol") if action == "BUY_CALL"
                 else state.get("pe_symbol"))
 
@@ -927,6 +1151,8 @@ def _execute_live_close(pos: dict, cur_p: float) -> None:
 
 
 def run_signal(market_data):
+    if not is_market_open():
+        return
     if not _signal_lock.acquire(blocking=False):
         return
     try:
@@ -943,17 +1169,32 @@ def run_signal(market_data):
         if ledger["open_position"]:
             pos      = ledger["open_position"]
             pos_live = state.get("pos_premium_live")
-            cur_p    = pos_live or (
-                state["ce_premium"] if pos["action"] == "BUY_CALL"
-                else state["pe_premium"]
-            )
-            if not cur_p:
+            if not pos_live:
+                # pos_premium_live not yet populated — subscription pending, skip this cycle
                 return
-            ep   = pos["entry_premium"]
-            cpct = (cur_p - ep) / ep * 100
+            cur_p = pos_live
+            ep    = pos["entry_premium"]
+            cpct  = (cur_p - ep) / ep * 100
             market_data["option_premium"] = cur_p
 
-            if strategy_mode in ("ORB", "HYBRID"):
+            pos_source = pos.get("source", "")
+            if pos_source == "gap_and_go":
+                gap_exit = None
+                if cur_time >= "10:00":
+                    gap_exit = f"⏰ 10:00 AM exit ({cpct:+.1f}%)"
+                elif cpct >= 40:
+                    gap_exit = f"🎯 +{cpct:.1f}% gap target"
+                elif cpct <= -25:
+                    gap_exit = f"🛑 {cpct:.1f}% gap stop"
+                if gap_exit:
+                    add_log(f"{gap_exit} — closing!")
+                    _log_auto(f"AUTO-CLOSE GAP | {pos.get('action')} {pos.get('trading_symbol','')} | entry ₹{ep} cur ₹{cur_p:.1f} {cpct:+.1f}% | {gap_exit}")
+                    _execute_live_close(pos, cur_p)
+                    close_trade(market_data, cur_p, gap_exit)
+                    state["pos_instrument"]   = None
+                    state["pos_premium_live"] = None
+                    draw()
+            elif strategy_mode in ("ORB", "HYBRID") or pos_source in ("orb", "hybrid"):
                 target = getattr(_main, "ORB_PROFIT_TARGET", 75)
                 stop   = getattr(_main, "ORB_STOP_LOSS", -35)
                 # Raise stop to breakeven once gain reaches +40%
@@ -979,23 +1220,7 @@ def run_signal(market_data):
                     state["pos_premium_live"] = None
                     state["orb_trail_active"] = False
                     draw()
-            elif strategy_mode == "GAP_AND_GO":
-                gap_exit = None
-                if cur_time >= "10:00":
-                    gap_exit = f"⏰ 10:00 AM exit ({cpct:+.1f}%)"
-                elif cpct >= 40:
-                    gap_exit = f"🎯 +{cpct:.1f}% gap target"
-                elif cpct <= -25:
-                    gap_exit = f"🛑 {cpct:.1f}% gap stop"
-                if gap_exit:
-                    add_log(f"{gap_exit} — closing!")
-                    _log_auto(f"AUTO-CLOSE GAP | {pos.get('action')} {pos.get('trading_symbol','')} | entry ₹{ep} cur ₹{cur_p:.1f} {cpct:+.1f}% | {gap_exit}")
-                    _execute_live_close(pos, cur_p)
-                    close_trade(market_data, cur_p, gap_exit)
-                    state["pos_instrument"]   = None
-                    state["pos_premium_live"] = None
-                    draw()
-            elif strategy_mode == "VWAP_REVERSAL":
+            elif strategy_mode == "VWAP_REVERSAL" or pos_source == "vwap_reversal":
                 target_pct = getattr(_main, "VWAP_PROFIT_TARGET", 25)
                 stop_pct   = getattr(_main, "VWAP_STOP_LOSS", -20)
                 vwap_v     = state.get("vwap")
@@ -1063,13 +1288,46 @@ def run_signal(market_data):
             else:
                 result = None
         elif strategy_mode == "HYBRID":
-            orb_result = _check_orb_signal(market_data)
-            result     = _main.on_orb_signal(orb_result, market_data) if orb_result else None
+            # Gap-and-go pre-check: if a qualifying gap exists and it's before 10:00,
+            # take the gap trade immediately instead of waiting for ORB breakout.
+            if (state.get("gap_signal") and not state.get("gap_traded")
+                    and not state.get("orb_traded_today")
+                    and cur_time < "10:00"):
+                _live_ce   = state.get("ce_premium")
+                _live_pe   = state.get("pe_premium")
+                _ce_inst   = state.get("ce_instrument")
+                _pe_inst   = state.get("pe_instrument")
+                if not _live_ce or not _live_pe or not _ce_inst or not _pe_inst:
+                    # Options not fully subscribed yet — retry on next tick
+                    add_log("⏳ Gap signal ready — waiting for option data...")
+                    result = None
+                else:
+                    # Patch market_data with fresh premiums (built before options loaded)
+                    market_data["option_premium_ce"] = _live_ce
+                    market_data["option_premium_pe"] = _live_pe
+                    market_data["option_premium"]    = _live_ce
+                    state["gap_traded"]       = True
+                    state["orb_traded_today"] = True   # counts as the day's trade
+                    result = _main.on_gap_signal(state["gap_pct"], market_data)
+            else:
+                orb_result = _check_orb_signal(market_data)
+                result     = _main.on_orb_signal(orb_result, market_data) if orb_result else None
         elif strategy_mode == "GAP_AND_GO":
             if (state.get("gap_signal") and not state.get("gap_traded")
                     and cur_time < "10:00"):
-                state["gap_traded"] = True
-                result = _main.on_gap_signal(state["gap_pct"], market_data)
+                _live_ce = state.get("ce_premium")
+                _live_pe = state.get("pe_premium")
+                _ce_inst = state.get("ce_instrument")
+                _pe_inst = state.get("pe_instrument")
+                if not _live_ce or not _live_pe or not _ce_inst or not _pe_inst:
+                    add_log("⏳ Gap signal ready — waiting for option data...")
+                    result = None
+                else:
+                    market_data["option_premium_ce"] = _live_ce
+                    market_data["option_premium_pe"] = _live_pe
+                    market_data["option_premium"]    = _live_ce
+                    state["gap_traded"] = True
+                    result = _main.on_gap_signal(state["gap_pct"], market_data)
             else:
                 result = None
         elif strategy_mode == "VWAP_REVERSAL":
@@ -1171,31 +1429,42 @@ def handle_key(ch):
             # Always look up instrument key dynamically
             def sub_new_position(s=sig, p=popt):
                 from option_chain import get_all_contracts, get_nearest_expiry
-                action   = s.get("action", "BUY_CALL")
-                opt_type = "CE" if action == "BUY_CALL" else "PE"
-                strike   = s.get("strike")
-                if not strike:
-                    return
-                contracts = get_all_contracts()
-                expiry    = get_nearest_expiry()
-                match = next((c for c in contracts
-                              if c["expiry"] == expiry
-                              and c["instrument_type"] == opt_type
-                              and c["strike_price"] == float(strike)), None)
-                if match:
-                    # Update JSON with verified key
-                    import json
-                    with open("paper_trades.json") as f:
-                        data = json.load(f)
-                    if data.get("open_position"):
-                        data["open_position"]["instrument_key"] = match["instrument_key"]
-                        data["open_position"]["trading_symbol"] = match["trading_symbol"]
-                        with open("paper_trades.json", "w") as f:
-                            json.dump(data, f, indent=2)
-                    subscribe_position(match["instrument_key"], p["premium"])
-                    add_log(f"✅ Subscribed: {match['instrument_key']}")
-                else:
-                    add_log(f"⚠️  Contract not found for {opt_type} @ {strike}")
+                import json as _json
+
+                # Prefer instrument_key already resolved in signal
+                inst_key = s.get("instrument_key") or ""
+                sym      = s.get("trading_symbol") or ""
+
+                # Fallback: look up by strike if key missing
+                if not inst_key:
+                    action   = s.get("action", "BUY_CALL")
+                    opt_type = "CE" if action == "BUY_CALL" else "PE"
+                    strike   = s.get("strike")
+                    if not strike:
+                        add_log("⚠️  sub_new_position: no strike or instrument_key — can't subscribe")
+                        return
+                    contracts = get_all_contracts()
+                    expiry    = get_nearest_expiry()
+                    match = next((c for c in contracts
+                                  if c["expiry"] == expiry
+                                  and c["instrument_type"] == opt_type
+                                  and c["strike_price"] == float(strike)), None)
+                    if not match:
+                        add_log(f"⚠️  Contract not found for {opt_type} @ {strike}")
+                        return
+                    inst_key = match["instrument_key"]
+                    sym      = match["trading_symbol"]
+
+                # Update JSON with verified key
+                with open("paper_trades.json") as f:
+                    data = _json.load(f)
+                if data.get("open_position"):
+                    data["open_position"]["instrument_key"] = inst_key
+                    data["open_position"]["trading_symbol"] = sym
+                    with open("paper_trades.json", "w") as f:
+                        _json.dump(data, f, indent=2)
+                subscribe_position(inst_key, p["premium"])
+                add_log(f"✅ Subscribed: {inst_key}")
             threading.Thread(target=sub_new_position, daemon=True).start()
             add_log(f"✅ Opened {sig['action']} @ ₹{popt['premium']}")
         else:
@@ -1213,8 +1482,14 @@ def handle_key(ch):
         from paper_trader import load_ledger, close_trade
         ledger = load_ledger()
         if ledger["open_position"]:
-            pos   = ledger["open_position"]
-            cur_p = state.get("pos_premium_live") or pos["entry_premium"]
+            pos      = ledger["open_position"]
+            live     = state.get("pos_premium_live")
+            if not live:
+                # No live tick yet — refuse exit rather than book at entry premium
+                add_log("⚠️  Manual exit blocked — no live price yet for bought contract")
+                draw()
+                return
+            cur_p = live
             ep    = pos["entry_premium"]
             pnl   = (cur_p - ep) * pos["quantity"]
             add_log(f"🔴 Manual exit @ ₹{cur_p} P&L: ₹{pnl:+.0f}")
@@ -1259,8 +1534,12 @@ if __name__ == "__main__":
     )
     add_log("Starting Pillar Trading...")
     draw()
-    threading.Thread(target=run_streamer, daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    notifier.start_command_polling()
+    notifier.register_trade_callback(handle_key)
+    threading.Thread(target=heartbeat_loop,    daemon=True).start()
+    threading.Thread(target=daily_reset_loop,  daemon=True).start()
+    _startup_token_check()      # blocks here if token expired; streamer starts after
+    threading.Thread(target=run_streamer,      daemon=True).start()
     try:
         input_loop()
     except KeyboardInterrupt:

@@ -165,6 +165,23 @@ def on_orb_signal(orb_result: dict, market_data: dict):
     option_data          = orb_result["option_data"]
     premium              = option_data["premium"]
 
+    if not signal.get("instrument_key"):
+        try:
+            from option_chain import get_all_contracts, get_nearest_expiry
+            opt_type  = "CE" if action == "BUY_CALL" else "PE"
+            contracts = get_all_contracts()
+            expiry    = get_nearest_expiry()
+            _m = next((c for c in contracts
+                       if c["expiry"] == expiry
+                       and c["instrument_type"] == opt_type
+                       and c["strike_price"] == float(signal.get("strike", 0))), None)
+            if _m:
+                signal["instrument_key"] = _m["instrument_key"]
+                signal["trading_symbol"] = signal.get("trading_symbol") or _m["trading_symbol"]
+                option_data["instrument_key"] = _m["instrument_key"]
+        except Exception:
+            pass
+
     approval = risk.approve_trade(signal, premium, 65)
     if not approval["approved"]:
         log(f"🚫 {approval['reason']}")
@@ -225,6 +242,24 @@ def on_gap_signal(gap_pct: float, market_data: dict):
     if _mf:
         inst_key = (_mf.state.get("ce_instrument") if action == "BUY_CALL"
                     else _mf.state.get("pe_instrument"))
+
+    if not inst_key:
+        try:
+            from option_chain import get_all_contracts, get_nearest_expiry
+            opt_type  = "CE" if action == "BUY_CALL" else "PE"
+            atm       = round(market_data.get("ltp", 0) / 50) * 50
+            contracts = get_all_contracts()
+            expiry    = get_nearest_expiry()
+            _m = next((c for c in contracts
+                       if c["expiry"] == expiry
+                       and c["instrument_type"] == opt_type
+                       and c["strike_price"] == float(atm)), None)
+            if _m:
+                inst_key = _m["instrument_key"]
+                symbol   = symbol or _m["trading_symbol"]
+                strike   = strike or int(_m["strike_price"])
+        except Exception:
+            pass
 
     signal = {
         "action"        : action,

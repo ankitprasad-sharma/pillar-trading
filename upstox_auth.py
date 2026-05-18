@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import webbrowser
 import threading
@@ -47,8 +48,9 @@ def callback():
 
         access_token = data["access_token"]
 
-        # Save to .env automatically
+        # Save token + timestamp to .env
         set_key(ENV_FILE, "UPSTOX_ACCESS_TOKEN", access_token)
+        set_key(ENV_FILE, "UPSTOX_TOKEN_TIME", str(int(time.time())))
         print(f"\n✅ Access token saved to .env!")
         print(f"Token preview: {access_token[:20]}...")
 
